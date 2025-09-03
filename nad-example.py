@@ -30,14 +30,13 @@ import moderngl
 
 def rgb_to_params(r: int, g: int, b: int) -> Tuple[float, float, str]:
     """
-    Map ONLY the Red (R) channel to frequency; keep amplitude constant; waveform still selected by B.
-    - Frequency from Red (R): 0–255 → 220–880 Hz (log scale)
-    - Amplitude: constant 0.18 (independent of RGB)
-    - Waveform from Blue (B): 0–85 sine, 86–170 square, 171–255 sawtooth
+    Map brightness to frequency (linear), keep amplitude constant.
+    brightness = (r + g + b) / 3
+    freq = 200 + (brightness / 255) * 800
+    Waveform still selected by Blue (B): 0–85 sine, 86–170 square, 171–255 sawtooth.
     """
-    f_min, f_max = 220.0, 880.0
-    r_norm = r / 255.0
-    freq = f_min * ((f_max / f_min) ** r_norm)
+    brightness = (float(r) + float(g) + float(b)) / 3.0
+    freq = 200.0 + (brightness / 255.0) * 800.0
     amp = 0.18  # fixed amplitude
     if b <= 85:
         waveform = "sine"
@@ -45,7 +44,7 @@ def rgb_to_params(r: int, g: int, b: int) -> Tuple[float, float, str]:
         waveform = "square"
     else:
         waveform = "sawtooth"
-    return freq, amp, waveform
+    return float(freq), float(amp), waveform
 
 
 # ----------------------- Audio Synth (continuous stream) -----------------------
@@ -577,20 +576,20 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                     break  # sensor not available or not started
                 if ev is None:
                     break  # no more events pending
-                # Print event info if requested
+                # Optional verbose print of all eye events
                 if debug_eye_events:
                     try:
                         name = type(ev).__name__
-                        # Prefer datetime if available
                         ts = getattr(ev, "rtp_ts_unix_seconds", None)
                         if ts is None:
                             ts = getattr(ev, "timestamp_unix_ns", None)
                         print(f"[eye-events] {name}: {ev} @ {ts}")
                     except Exception:
                         print(f"[eye-events] {type(ev).__name__}")
-                # Trigger drums on blink
+                # Trigger drums on blink and always print a concise line
                 if isinstance(ev, BlinkEventData):
                     synth.trigger_drum("kick")
+                    print("[blink] detected -> KICK")
 
             # Extract normalized gaze (0..1)
             g = extract_norm_gaze_xy(gaze)
@@ -621,6 +620,8 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
             now = time.time()
             if now - last_update >= (1.0 / throttle_hz):
                 synth.set_params(freq, amp, waveform)
+                # Console log of RGB and mapped frequency
+                print(f"[color->sound] RGB=({int(Rs)},{int(Gs)},{int(Bs)}) brightness={(int((int(Rs)+int(Gs)+int(Bs))/3))} -> freq={freq:.1f} Hz")
                 last_update = now
 
             H, S, V = hsv_from_bgr(int(Bs), int(Gs), int(Rs))
@@ -654,7 +655,7 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                 cv2.circle(vis_img, (x, y), 8, (0, 255, 255), 2)
                 cv2.putText(
                     vis_img,
-                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  f={freq:6.1f}Hz  amp={(amp):0.2f}  wave={waveform}  patch={2}  spd={speed_smooth:0.3f}  S={S:0.2f}  H={H:0.1f}",
+                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  f={freq:6.1f}Hz  amp={(amp):0.2f}  wave={waveform}  patch={2}  spd={speed_smooth:0.3f}  S={S:0.2f}  H={H:0.1f}  bright={int((int(Rs)+int(Gs)+int(Bs))/3)}",
                     (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
