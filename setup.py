@@ -5,13 +5,13 @@ setup(
     version="1.0.0",
     description="Eye Trance Art Project",
     url="https://github.com/michi-d/eye_trance",
-    author="Nadya / Lana / Michi",
+    author="Nadia / Lana / Michi",
     packages=find_packages(),
     install_requires=[
         "numpy>=1.26",
         "matplotlib>=3.10",
         "pillow>=11.2",
-        "glfw", 
-        "numpy"
+        "glfw",
+        "numpy",
     ],
 )
