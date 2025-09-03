@@ -103,14 +103,14 @@ class ContinuousSine:
             f = f0 * (f1 / f0) ** (t / dur)
             phase = 2 * np.pi * np.cumsum(f) / sr
             env = np.exp(-t * 35.0)
-            buf = 1.0 * env * np.sin(phase)
+            buf = 1.8 * env * np.sin(phase)
         elif kind == "snare":
             dur = 0.15
             n = int(sr * dur)
             t = np.linspace(0, dur, n, endpoint=False).astype(np.float32)
             noise = np.random.uniform(-1.0, 1.0, size=n).astype(np.float32)
             env = np.exp(-t * 25.0)
-            buf = 0.4 * env * noise
+            buf = 0.6 * env * noise
         else:
             return
         with self._lock:
@@ -152,6 +152,8 @@ class ContinuousSine:
                     to_remove.append(i)
             for i in reversed(to_remove):
                 self._oneshots.pop(i)
+        # Safety clip to avoid digital clipping when drums + tone sum
+        mix = np.clip(mix, -0.99, 0.99)
         # write out
         outdata[:, 0] = mix
 
