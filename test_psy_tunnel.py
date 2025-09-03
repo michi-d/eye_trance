@@ -139,14 +139,18 @@ def main():
     # Example: keyboard-controlled modulation (hold keys to test)
     # Replace this with your real-time signal each frame.
     def sample_mod_signal():
-        val = 0.0
-        if glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS:
-            val += 0.75
-        if glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS:
-            val += 0.25
-        # Mild breathing when idle so it never looks static
-        val += 0.25 * (0.5 + 0.5 * np.sin((time.perf_counter() - start) * 1.2))
-        return float(val)
+        signal = get_mouse_pos(window)
+        signal = signal % 1000  # keep in reasonable range
+        signal = signal / 1000.0  # normalize to [0..1]
+        return float(signal)
+        # val = 0.0
+        # if glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS:
+        #     val += 0.75
+        # if glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS:
+        #     val += 0.25
+        # # Mild breathing when idle so it never looks static
+        # val += 0.25 * (0.5 + 0.5 * np.sin((time.perf_counter() - start) * 1.2))
+        # return float(val)
 
     while not glfw.window_should_close(window):
         now = time.perf_counter()
@@ -179,6 +183,11 @@ def main():
             break
 
     glfw.terminate()
+
+
+def get_mouse_pos(window):
+    x, y = glfw.get_cursor_pos(window)
+    return x + y
 
 
 if __name__ == "__main__":
