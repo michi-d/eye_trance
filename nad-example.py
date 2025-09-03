@@ -68,135 +68,233 @@ def rgb_to_params(r: int, g: int, b: int) -> Tuple[float, float, str]:
 
 # ----------------------- Audio Synth (continuous stream) -----------------------
 
-class ContinuousSine:
+
+# --- NEW SOUND SYNTHESIS CODE (beat + melodic/experimental) ---
+# Scale degrees (default: Dorian-ish, musical but moody)
+SCALE_DEGREES = [0, 2, 3, 5, 7, 9, 10]
+
+def hue_to_semitone_root(h: float) -> int:
+    """Map hue in degrees [0..360) to a chromatic root 0..11."""
+    h = float(h) % 360.0
+    return int(np.floor((h / 360.0) * 12.0)) % 12
+
+def quantize_note(midi_base: int, degrees, octave: int, step: int) -> float:
+    """Pick a note from a scale pattern, cycling with step."""
+    deg = degrees[int(step % len(degrees))]
+    return float(midi_base + deg + 12 * int(octave))
+
+def midi_to_freq(m: float) -> float:
+    return 440.0 * (2.0 ** ((float(m) - 69.0) / 12.0))
+
+def make_note_from_rgb(r: int, g: int, b: int, step: int) -> tuple[float, float, float, float, float]:
     """
-    Low-latency continuous waveform generator whose frequency, amplitude,
-    and waveform shape can be updated from another thread (our vision/gaze thread).
+    Produce musical params from RGB + current step:
+      - Hue -> scale root (chromatic 0..11)
+      - Brightness -> octave (3..6)
+      - Saturation/Blue -> timbre/detune
+      - Returns: (freq_hz, amp, detune_cents, fifth_mix, cutoff_hz)
     """
-    def __init__(self, samplerate: int = 44100):
-        self.sr = samplerate
-        self._freq = 440.0
-        self._amp = 0.12
-        self._waveform = "sine"
-        self._phase = 0.0
-        self._cutoff = 1200.0  # Hz, low-pass cutoff (G channel)
-        self._lp_state = 0.0   # filter memory for one-pole LPF
-        self._lock = threading.Lock()
-        self._stream: Optional[sd.OutputStream] = None
-        # one-shot drums
-        self._oneshots = []  # list of dicts: {"buf": np.ndarray, "idx": int}
+    # HSV from RGB (r,g,b are 0..255)
+    hsv = cv2.cvtColor(np.array([[[int(b), int(g), int(r)]]], dtype=np.uint8), cv2.COLOR_BGR2HSV)[0, 0]
+    H = float(hsv[0]) * (360.0 / 179.0)
+    S = float(hsv[1]) / 255.0
+    V = float(hsv[2]) / 255.0
 
-    def start(self):
-        self._stream = sd.OutputStream(
-            samplerate=self.sr,
-            channels=1,
-            dtype="float32",
-            callback=self._callback,
-            blocksize=0,  # let PortAudio choose for low latency
-        )
-        self._stream.start()
+    root = hue_to_semitone_root(H)              # 0..11
+    base_midi = 60 + root - 0                   # around C4 shifted by hue
+    # brightness -> octave 3..6 (weighted to mid)
+    octave = 3 + int(np.clip(np.round(V * 3.0), 0, 3))
+    midi = quantize_note(base_midi, SCALE_DEGREES, octave, step)
 
-    def stop(self):
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+    freq = midi_to_freq(midi)
+    amp = 0.16 + 0.12 * (V ** 1.2)              # a bit louder on brighter
+    detune_cents = 3.0 + 12.0 * (S ** 1.1)      # 3..15 cents detune by saturation
+    fifth_mix = 0.15 + 0.35 * (b / 255.0)       # more fifth with bluer
+    cutoff_hz = 800.0 + 2600.0 * (g / 255.0)    # green -> brightness of tone (filter)
+    return float(freq), float(amp), float(detune_cents), float(fifth_mix), float(cutoff_hz)
 
-    def set_params(self, freq: float, amp: float, waveform: str):
-        with self._lock:
-            self._freq = float(max(1.0, freq))
-            self._amp = float(np.clip(amp, 0.0, 1.0))
-            if waveform in ("sine", "square", "sawtooth"):
-                self._waveform = waveform
-            else:
-                self._waveform = "sine"
+# Drums
+def trigger_drum(sr, kind="kick"):
+    if kind == "kick":
+        dur = 0.16
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        f0, f1 = 160.0, 58.0
+        f = f0 * (f1 / f0) ** (t / dur)
+        phase = 2 * np.pi * np.cumsum(f) / sr
+        env = np.exp(-t * 30.0)
+        click = np.exp(-t * 1200.0) * 0.35
+        buf = 1.6 * env * np.sin(phase) + click
+    elif kind == "snare":
+        dur = 0.14
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        noise = np.random.uniform(-1.0, 1.0, n)
+        tone = np.sin(2 * np.pi * 200.0 * t)
+        env = np.exp(-t * 28.0)
+        buf = 0.55 * env * (0.8 * noise + 0.2 * tone)
+    else:
+        buf = np.zeros(1)
+    return buf.astype(np.float32)
 
-    def set_filter_cutoff(self, cutoff_hz: float):
-        with self._lock:
-            self._cutoff = float(np.clip(cutoff_hz, 50.0, 8000.0))
+# Melodic voice chunk (adds detuned pair + optional 5th, with soft overdrive & tiny ADSR)
+def generate_arp_chunk(freq, amp, duration, sr, detune_cents=7.0, fifth_mix=0.25):
+    n = int(sr * duration)
+    if n <= 0:
+        return np.zeros(1, dtype=np.float32)
+    t = np.linspace(0.0, duration, n, endpoint=False)
+    # convert cents to ratio
+    r = 2 ** (detune_cents / 1200.0)
+    f1 = freq
+    f2 = freq * r
+    f5 = freq * 1.5
+    w1 = np.sin(2 * np.pi * f1 * t)
+    w2 = np.sin(2 * np.pi * f2 * t)
+    w5 = np.sin(2 * np.pi * f5 * t)
+    # tiny ADSR
+    a = int(0.005 * sr)
+    d = int(0.020 * sr)
+    env = np.ones(n, dtype=np.float32)
+    if a > 0:
+        env[:a] = np.linspace(0.0, 1.0, a)
+    if d > 0 and a + d < n:
+        env[a:a + d] = np.linspace(1.0, 0.75, d)
+        env[a + d:] = 0.75
+    # mix and soft saturate
+    mix = 0.7 * (w1 + w2) * 0.5 + fifth_mix * w5
+    tone = np.tanh(1.2 * mix) * env
+    return (amp * tone).astype(np.float32)
 
-    def trigger_drum(self, kind: str = "kick"):
-        """Schedule a short one-shot drum buffer to be mixed on the next callbacks."""
-        sr = self.sr
-        if kind == "kick":
-            dur = 0.12
-            n = int(sr * dur)
-            t = np.linspace(0, dur, n, endpoint=False).astype(np.float32)
-            # pitch sweep 150->60 Hz, exp amp decay
-            f0, f1 = 150.0, 60.0
-            f = f0 * (f1 / f0) ** (t / dur)
-            phase = 2 * np.pi * np.cumsum(f) / sr
-            env = np.exp(-t * 35.0)
-            buf = 1.8 * env * np.sin(phase)
-        elif kind == "snare":
-            dur = 0.15
-            n = int(sr * dur)
-            t = np.linspace(0, dur, n, endpoint=False).astype(np.float32)
-            noise = np.random.uniform(-1.0, 1.0, size=n).astype(np.float32)
-            env = np.exp(-t * 25.0)
-            buf = 0.6 * env * noise
-        else:
-            return
-        with self._lock:
-            self._oneshots.append({"buf": buf.astype(np.float32), "idx": 0})
+# Simple one-pole low-pass filter
+class OnePoleLP:
+    def __init__(self, sr):
+        self.sr = float(sr)
+        self.y = 0.0
+    def process(self, x, cutoff_hz):
+        cutoff_hz = float(np.clip(cutoff_hz, 50.0, 8000.0))
+        # bilinear transform approximation for one-pole
+        x = float(x)
+        rc = 1.0 / (2 * np.pi * cutoff_hz)
+        dt = 1.0 / self.sr
+        alpha = dt / (rc + dt)
+        self.y += alpha * (x - self.y)
+        return self.y
 
-    def _callback(self, outdata, frames, time_info, status):
-        if status:
-            # Print once per callback if glitches occur
-            print("Audio status:", status)
-        # Atomically read current params
-        with self._lock:
-            f = self._freq
-            a = self._amp
-            w = self._waveform
-        t = (np.arange(frames, dtype=np.float32) + self._phase) / self.sr
-        if w == "sine":
-            buf = a * np.sin(2.0 * np.pi * f * t)
-        elif w == "square":
-            buf = a * np.sign(np.sin(2.0 * np.pi * f * t))
-        elif w == "sawtooth":
-            # Sawtooth from -1 to 1
-            buf = a * (2.0 * (t * f - np.floor(0.5 + t * f)))
-        else:
-            buf = a * np.sin(2.0 * np.pi * f * t)
-        self._phase = (self._phase + frames) % self.sr
-        # base tone in "buf"
-        mix = buf.copy()
-        # mix any scheduled one-shots
-        with self._lock:
-            to_remove = []
-            for i, ev in enumerate(self._oneshots):
-                start = ev["idx"]
-                remaining = ev["buf"].shape[0] - start
-                take = min(frames, remaining)
-                if take > 0:
-                    mix[:take] += ev["buf"][start:start+take]
-                    ev["idx"] += take
-                if ev["idx"] >= ev["buf"].shape[0]:
-                    to_remove.append(i)
-            for i in reversed(to_remove):
-                self._oneshots.pop(i)
-        # --- One-pole low-pass filter controlled by _cutoff ---
-        with self._lock:
-            cutoff = self._cutoff
-        # Compute smoothing coefficient per block using bilinear-like RC
-        # alpha = dt / (RC + dt), RC = 1/(2*pi*fc), dt = 1/sr
-        dt = 1.0 / float(self.sr)
-        RC = 1.0 / (2.0 * np.pi * max(10.0, cutoff))
-        alpha = dt / (RC + dt)
-        # clamp alpha to (0,1)
-        alpha = float(np.clip(alpha, 0.0001, 0.9999))
-        y = np.empty_like(mix)
-        s = self._lp_state
-        for i in range(mix.shape[0]):
-            s = s + alpha * (mix[i] - s)
-            y[i] = s
-        self._lp_state = float(s)
-        mix = y
-        # Safety clip after filtering
-        mix = np.clip(mix, -0.99, 0.99)
-        # write out
-        outdata[:, 0] = mix
+# --- Audio engine state ---
+sr = 44100
+bpm = 140
+samples_per_beat = int(sr * 60 / bpm)
+sample_counter = 0
+drum_step = 0
+melody_step = 0
+
+kick = trigger_drum(sr, "kick")
+snare = trigger_drum(sr, "snare")
+kick_pos = 0
+snare_pos = 0
+melody_buf = np.zeros(1, dtype=np.float32)
+melody_pos = 0
+
+# Stereo ping-pong delays (polyrhythmic)
+delay_L = np.zeros(samples_per_beat * 4, dtype=np.float32)
+delay_R = np.zeros(samples_per_beat * 4, dtype=np.float32)
+wp_L = 0
+wp_R = 0
+# 3/8 beat on L, 5/8 beat on R
+DL = int(samples_per_beat * 1.5)
+DR = int(samples_per_beat * 2.5)
+fb = 0.35  # feedback
+mix_del = 0.30
+
+# Filter for master bus
+lpL = OnePoleLP(sr)
+lpR = OnePoleLP(sr)
+current_cutoff = 1600.0
+
+# Shared state for gaze-driven color
+latest_rgb = np.array([128, 128, 128], dtype=np.uint8)
+latest_rgb_lock = threading.Lock()
+# For blink-triggered drums
+pending_kick = threading.Event()
+
+def audio_callback(outdata, frames, time_info, status):
+    global sample_counter, drum_step, melody_step, kick_pos, snare_pos, melody_buf, melody_pos
+    global delay_L, delay_R, wp_L, wp_R, current_cutoff
+    if status:
+        print("Audio status:", status)
+    outL = np.zeros(frames, dtype=np.float32)
+    outR = np.zeros(frames, dtype=np.float32)
+
+    for i in range(frames):
+        # --- Beat grid ---
+        if sample_counter % samples_per_beat == 0:
+            if drum_step % 4 == 0:
+                kick_pos = 0
+            if drum_step % 4 == 2:
+                snare_pos = 0
+            drum_step += 1
+
+        # Blink one-shot kick
+        if pending_kick.is_set():
+            kick_pos = 0
+            pending_kick.clear()
+
+        # Mix drums
+        s = 0.0
+        if kick_pos < len(kick):
+            s += kick[kick_pos]
+            kick_pos += 1
+        if snare_pos < len(snare):
+            s += snare[snare_pos]
+            snare_pos += 1
+
+        # --- Melody: refresh every 1/8 note with arpeggio chunk ---
+        if sample_counter % (samples_per_beat // 2) == 0:
+            with latest_rgb_lock:
+                r, g, b = latest_rgb
+            freq, amp, detc, fifth_mix, cutoff = make_note_from_rgb(int(r), int(g), int(b), melody_step)
+            # 1/8 note duration
+            seg_dur = samples_per_beat / (2 * sr)
+            melody_buf = generate_arp_chunk(freq, amp, seg_dur, sr, detune_cents=detc, fifth_mix=fifth_mix)
+            melody_pos = 0
+            current_cutoff = cutoff
+            melody_step += 1
+
+        if melody_pos < len(melody_buf):
+            s += melody_buf[melody_pos]
+            melody_pos += 1
+
+        # --- Stereo ping-pong delay ---
+        # read positions
+        rp_L = (wp_L - DL) % delay_L.size
+        rp_R = (wp_R - DR) % delay_R.size
+        dl = delay_L[rp_L]
+        dr = delay_R[rp_R]
+        # write new samples with feedback (ping-pong)
+        delay_L[wp_L] = s + dr * fb
+        delay_R[wp_R] = s + dl * fb
+        # dry+wet mix
+        left = s * (1.0 - mix_del) + dl * mix_del
+        right = s * (1.0 - mix_del) + dr * mix_del
+        wp_L = (wp_L + 1) % delay_L.size
+        wp_R = (wp_R + 1) % delay_R.size
+
+        # --- Gentle low-pass following green channel ---
+        left = lpL.process(left, current_cutoff)
+        right = lpR.process(right, current_cutoff)
+
+        outL[i] = left
+        outR[i] = right
+        sample_counter += 1
+
+    # Soft limiter
+    outL = np.clip(outL, -0.98, 0.98)
+    outR = np.clip(outR, -0.98, 0.98)
+    outdata[:] = np.stack([outL, outR], axis=1)
+
+# Start audio stream (stereo)
+audio_stream = sd.OutputStream(channels=2, callback=audio_callback, samplerate=sr, blocksize=1024)
+audio_stream.start()
 
 
 # ----------------------- Helpers: mapping + gaze extraction -----------------------
@@ -517,14 +615,7 @@ void main(){
     irisCol.r += offs * sin(a*3.0 + t*0.9);
     irisCol.b += -offs * cos(a*3.5 + t*1.0);
 
-    // Retint iris by gaze hue without destroying texture detail
-    // Keep Value from iris, steer Hue fully to gaze hue, blend Saturation by cs
-    vec3 irisHSV = rgb2hsv(irisCol);
-    vec3 gazeHSV = rgb2hsv(u_col);
-    float kS = clamp(cs, 0.0, 1.0);
-    irisHSV.x = gazeHSV.x;                     // take gaze hue (stable hue match)
-    irisHSV.y = mix(irisHSV.y, gazeHSV.y, kS); // saturation follows cs
-    irisCol = hsv2rgb(irisHSV);
+    irisCol = toward(irisCol, u_col, cs);
 
     // ---------- sclera ----------
     float sclV = fbm(pw*6.0 + vec2(t*0.25, -t*0.18));
@@ -912,9 +1003,6 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
     if debug_eye_events:
         print("[eye-events] Debug printing enabled. Make sure 'Compute fixations' is ON in Companion settings.")
 
-    # Audio engine
-    synth = ContinuousSine(samplerate=44100)
-    synth.start()
 
     # Smoothing for RGB & amplitude (less jitter)
     rgb_ema = EMA(alpha=0.25, init=np.array([128.0, 128.0, 128.0], dtype=np.float32))
@@ -994,7 +1082,7 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                         print(f"[eye-events] {type(ev).__name__}")
                 # Trigger drums on blink and always print a concise line
                 if isinstance(ev, BlinkEventData):
-                    synth.trigger_drum("kick")
+                    pending_kick.set()
                     print("[blink] detected -> KICK")
                     last_blink_perf = time.perf_counter()
 
@@ -1017,7 +1105,7 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                 y = int(np.clip(gy, 0.0, 1.0) * (h - 1))
 
             if conf < min_conf:
-                synth.set_params(synth._freq, 0.0, synth._waveform)
+                # keep previous sound; just skip updating color this frame
                 continue
 
             # Sample single pixel at gaze coordinate (no patch averaging)
@@ -1025,21 +1113,15 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
             # Smooth RGB values (EMA) to reduce flicker
             Rs, Gs, Bs = rgb_ema(np.array([r, g_, b], dtype=np.float32))
 
-            # Map RGB to freq, amp, waveform
-            freq, amp, waveform = rgb_to_params(int(Rs), int(Gs), int(Bs))
-            amp = float(amp_ema(np.array([amp], dtype=np.float32))[0])
-            # Map G -> low-pass cutoff (300..3000 Hz) with EMA smoothing
-            cutoff_raw = float(np.interp(np.clip(Gs, 0.0, 255.0), [0.0, 255.0], [300.0, 3000.0]))
-            cutoff = float(cutoff_ema(np.array([cutoff_raw], dtype=np.float32))[0])
+            # Update shared RGB for audio thread (melody will quantize on the next 1/8th)
+            with latest_rgb_lock:
+                latest_rgb[:] = [int(Rs), int(Gs), int(Bs)]
 
-            # Throttle parameter pushes to audio engine
+            # Optional: print current mapped tone (no direct synth control here)
             now = time.time()
             if now - last_update >= (1.0 / throttle_hz):
-                synth.set_params(freq, amp, waveform)
-                synth.set_filter_cutoff(cutoff)
-                print(
-                    f"[color->sound] R={int(Rs)} G={int(Gs)} B={int(Bs)} | note_f={freq:.1f}Hz cutoff={cutoff:.0f}Hz vol={amp:.2f}"
-                )
+                freq_dbg, amp_dbg, detc_dbg, fifth_dbg, cutoff_dbg = make_note_from_rgb(int(Rs), int(Gs), int(Bs), melody_step)
+                print(f"[color->mel] R={int(Rs)} G={int(Gs)} B={int(Bs)} | f≈{freq_dbg:.1f}Hz detune={detc_dbg:.1f}c 5th={fifth_dbg:.2f} cut={cutoff_dbg:.0f}Hz")
                 last_update = now
 
             H, S, V = hsv_from_bgr(int(Bs), int(Gs), int(Rs))
@@ -1105,7 +1187,7 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                 # --- HUD text (top-left) ---
                 cv2.putText(
                     vis_img,
-                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  note={freq:6.1f}Hz  vol={amp:0.2f}  cutoff={cutoff:4.0f}Hz",
+                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  melodic~step={melody_step%16:02d}  cutoff≈{current_cutoff:4.0f}Hz",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
                 cv2.putText(
                     vis_img,
@@ -1168,7 +1250,11 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
     except KeyboardInterrupt:
         pass
     finally:
-        synth.stop()
+        try:
+            audio_stream.stop()
+            audio_stream.close()
+        except Exception:
+            pass
         device.close()
         if preview:
             cv2.destroyAllWindows()
