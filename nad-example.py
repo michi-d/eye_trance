@@ -30,30 +30,21 @@ import moderngl
 
 def rgb_to_params(r: int, g: int, b: int) -> Tuple[float, float, str]:
     """
-    Map RGB colors to audio parameters:
-    - Frequency from Red (R) channel: map 0-255 to 220-880 Hz logarithmically.
-    - Amplitude from Green (G) channel: map 0-255 to 0.05-0.25 linearly.
-    - Waveform type from Blue (B) channel:
-        0-85: sine
-        86-170: square
-        171-255: sawtooth
+    Map ONLY the Red (R) channel to frequency; keep amplitude constant; waveform still selected by B.
+    - Frequency from Red (R): 0–255 → 220–880 Hz (log scale)
+    - Amplitude: constant 0.18 (independent of RGB)
+    - Waveform from Blue (B): 0–85 sine, 86–170 square, 171–255 sawtooth
     """
-    # Frequency: log scale between 220 and 880 Hz
     f_min, f_max = 220.0, 880.0
     r_norm = r / 255.0
     freq = f_min * ((f_max / f_min) ** r_norm)
-
-    # Amplitude: linear between 0.05 and 0.25
-    amp = 0.05 + (0.25 - 0.05) * (g / 255.0)
-
-    # Waveform type based on B channel
+    amp = 0.18  # fixed amplitude
     if b <= 85:
         waveform = "sine"
     elif b <= 170:
         waveform = "square"
     else:
         waveform = "sawtooth"
-
     return freq, amp, waveform
 
 
@@ -112,7 +103,7 @@ class ContinuousSine:
             f = f0 * (f1 / f0) ** (t / dur)
             phase = 2 * np.pi * np.cumsum(f) / sr
             env = np.exp(-t * 35.0)
-            buf = 0.6 * env * np.sin(phase)
+            buf = 1.0 * env * np.sin(phase)
         elif kind == "snare":
             dur = 0.15
             n = int(sr * dur)
@@ -511,7 +502,7 @@ class VisualTunnel(threading.Thread):
 # ----------------------- Main loop -----------------------
 
 @click.command()
-@click.option("--ip", default='192.168.20.72', help="IP address of Neon Companion Device.")
+@click.option("--ip", default='192.168.20.114', help="IP address of Neon Companion Device.")
 @click.option("--port", default=8080, show_default=True, help="Neon Companion port.")
 @click.option("--preview", is_flag=True, help="Show scene preview with gaze dot.")
 @click.option("--debug-eye-events", is_flag=True, help="Print eye events (blink/fixation/saccade) to console")
