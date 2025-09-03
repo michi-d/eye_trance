@@ -320,6 +320,7 @@ in vec2 in_pos;
 void main(){
     gl_Position = vec4(in_pos, 0.0, 1.0);
 }
+
 """
 
 FRAG_SRC = """
@@ -374,6 +375,20 @@ vec3 pal(float t, vec3 A, vec3 B, vec3 C, vec3 D){
 }
 vec3 toward(vec3 base, vec3 target, float k){
     return mix(base, target, clamp(k, 0.0, 1.0));
+}
+// --- HSV helpers: rgb2hsv/hsv2rgb for hue retinting ---
+vec3 rgb2hsv(vec3 c){
+    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+vec3 hsv2rgb(vec3 c){
+    vec3 p = abs(fract(c.xxx + vec3(0.0, 1.0/3.0, 2.0/3.0)) * 6.0 - 3.0);
+    vec3 rgb = c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+    return rgb;
 }
 // ===========================================
 
@@ -436,7 +451,7 @@ void main(){
     a = atan(pw.y, pw.x);
 
     // ---------- pupil: STRONGER RANGE + prominence ----------
-    // Expanded range: minR smaller, maxR larger → visually prominent.
+    // Expanded range: minR smaller, maxR larger visually prominent.
     float minR = 0.06;
     float maxR = 0.30;               // was ~0.22
     float pupilTarget = mix(minR, maxR, pup);
@@ -502,8 +517,14 @@ void main(){
     irisCol.r += offs * sin(a*3.0 + t*0.9);
     irisCol.b += -offs * cos(a*3.5 + t*1.0);
 
-     // strong pull toward u_col
-    irisCol = toward(irisCol, u_col, cs * (0.65 + 0.15*env + 0.15*pup));
+    // Retint iris by gaze hue without destroying texture detail
+    // Keep Value from iris, steer Hue fully to gaze hue, blend Saturation by cs
+    vec3 irisHSV = rgb2hsv(irisCol);
+    vec3 gazeHSV = rgb2hsv(u_col);
+    float kS = clamp(cs, 0.0, 1.0);
+    irisHSV.x = gazeHSV.x;                     // take gaze hue (stable hue match)
+    irisHSV.y = mix(irisHSV.y, gazeHSV.y, kS); // saturation follows cs
+    irisCol = hsv2rgb(irisHSV);
 
     // ---------- sclera ----------
     float sclV = fbm(pw*6.0 + vec2(t*0.25, -t*0.18));
@@ -533,6 +554,111 @@ void main(){
     fragColor = vec4(col, 1.0);
 }
 """
+
+# ---- Offscreen VisualTunnelOffscreen renderer ----
+class VisualTunnelOffscreen:
+    """Render the same shader to an offscreen framebuffer and return an RGB image."""
+    def __init__(self, width: int = 640, height: int = 360):
+        self.width = int(width)
+        self.height = int(height)
+        self._window = None
+        self._ctx = None
+        self._vao = None
+        self._prog = None
+        self._fbo = None
+        self._uniforms = {}
+        self._inited = False
+
+    def init(self) -> bool:
+        # Hidden window (needed for a GL context on many platforms)
+        def _glfw_err(err, desc):
+            try:
+                msg = desc.decode("utf-8", "ignore") if isinstance(desc, (bytes, bytearray)) else str(desc)
+            except Exception:
+                msg = str(desc)
+            print(f"[GLFW] error {err}: {msg}")
+        glfw.set_error_callback(_glfw_err)
+        if not glfw.init():
+            print("[visuals-offscreen] Failed to init GLFW")
+            return False
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+        glfw.window_hint(glfw.DOUBLEBUFFER, glfw.TRUE)
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)  # hidden
+        self._window = glfw.create_window(self.width, self.height, "offscreen", None, None)
+        if not self._window:
+            print("[visuals-offscreen] Failed to create hidden window")
+            glfw.terminate()
+            return False
+        glfw.make_context_current(self._window)
+        glfw.swap_interval(0)
+        try:
+            self._ctx = moderngl.create_context()
+        except Exception as e:
+            print(f"[visuals-offscreen] moderngl context failed: {e}")
+            glfw.terminate()
+            return False
+        # geometry
+        vertices = np.array([-1.0, -1.0, 3.0, -1.0, -1.0, 3.0], dtype="f4")
+        vbo = self._ctx.buffer(vertices.tobytes())
+        self._prog = self._ctx.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC)
+        self._vao = self._ctx.simple_vertex_array(self._prog, vbo, "in_pos")
+        # uniforms
+        self._uniforms = {
+            "u_time": self._prog["u_time"],
+            "u_res": self._prog["u_res"],
+            "u_speed": self._prog["u_speed"],
+            "u_distort": self._prog["u_distort"],
+            "u_col": self._prog["u_col"],
+            "u_col_strength": self._prog["u_col_strength"],
+            "u_pupil": self._prog["u_pupil"],
+            "u_pulse_age": self._prog["u_pulse_age"],
+        }
+        # FBO setup
+        self._alloc_fbo(self.width, self.height)
+        self._inited = True
+        return True
+
+    def _alloc_fbo(self, w: int, h: int):
+        self.width, self.height = int(max(1, w)), int(max(1, h))
+        color = self._ctx.texture((self.width, self.height), 3)
+        depth = self._ctx.depth_renderbuffer((self.width, self.height))
+        self._fbo = self._ctx.framebuffer(color, depth)
+
+    def render_to_image(self, t: float, speed: float, distort: float, col_vec3: Tuple[float,float,float], col_strength: float, pupil: float, pulse_age: float, out_w: int, out_h: int) -> np.ndarray:
+        if not self._inited:
+            return None
+        # Resize FBO if needed
+        if out_w != self.width or out_h != self.height:
+            self._alloc_fbo(out_w, out_h)
+        self._fbo.use()
+        self._ctx.viewport = (0, 0, self.width, self.height)
+        self._uniforms["u_time"].value = float(t)
+        self._uniforms["u_res"].value = (float(self.width), float(self.height))
+        self._uniforms["u_speed"].value = float(np.clip(speed, 0.0, 2.0))
+        self._uniforms["u_distort"].value = float(np.clip(distort, 0.0, 2.0))
+        self._uniforms["u_col"].value = tuple(map(float, col_vec3))
+        self._uniforms["u_col_strength"].value = float(np.clip(col_strength, 0.0, 1.0))
+        self._uniforms["u_pupil"].value = float(np.clip(pupil, 0.0, 1.0))
+        self._uniforms["u_pulse_age"].value = float(max(0.0, pulse_age))
+        self._ctx.clear(0.0, 0.0, 0.0, 1.0)
+        self._vao.render()
+        # Read back RGB
+        data = self._fbo.read(components=3, alignment=1)
+        img = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3)
+        # OpenGL origin is bottom-left; flip vertically for OpenCV
+        img = np.flip(img, axis=0)
+        return img
+
+    def close(self):
+        try:
+            if self._window is not None:
+                glfw.destroy_window(self._window)
+        except Exception:
+            pass
+        glfw.terminate()
 
 class VisualTunnelEmbedded:
     """Non-threaded GLFW+moderngl renderer meant to be driven from the main thread (needed on macOS)."""
@@ -765,13 +891,14 @@ class VisualTunnel(threading.Thread):
 @click.option("--visuals", is_flag=True, help="Show shader tunnel visuals driven by gaze & color")
 @click.option("--fullscreen", is_flag=True, help="Open visuals in fullscreen")
 @click.option("--visuals-embedded", is_flag=True, help="Create the shader window on the main thread (macOS fix)")
+@click.option("--single-window", is_flag=True, help="Show scene (with gaze+eyes) on the left and shader visuals on the right in one OpenCV window")
 @click.option("--pupil-min-mm", default=1.0, show_default=True, help="Pupil min (mm) mapped to 0.0")
 @click.option("--pupil-max-mm", default=6.0, show_default=True, help="Pupil max (mm) mapped to 1.0")
 @click.option("--pupil-gamma", default=1.5, show_default=True, help="Nonlinear emphasis for pupil: output=(norm^gamma)")
 @click.option("--pupil-gain", default=1.5, show_default=True, help="Gain applied after gamma: output=gain*(norm^gamma)")
-@click.option("--patch-half", default=3, show_default=True, help="Half-size of the sampling patch around gaze (pixels). Actual patch = (2*half+1)^2")
+@click.option("--patch-half", default=50, show_default=True, help="Half-size of the sampling patch around gaze (pixels). Actual patch = (2*half+1)^2")
 @click.option("--col-strength", default=0.9, show_default=True, help="How strongly the iris follows the sampled RGB (0..1)")
-def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, visuals: bool, fullscreen: bool, visuals_embedded: bool, pupil_min_mm: float, pupil_max_mm: float, pupil_gamma: float, pupil_gain: float, patch_half: int, col_strength: float):
+def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, visuals: bool, fullscreen: bool, visuals_embedded: bool, single_window: bool, pupil_min_mm: float, pupil_max_mm: float, pupil_gamma: float, pupil_gain: float, patch_half: int, col_strength: float):
     # Connect device
     if ip:
         device = Device(address=ip, port=port)
@@ -800,6 +927,7 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
 
     vis = None
     vis_emb = None
+    vis_off = None
     if visuals:
         print("[visuals] Starting shader tunnel window...")
         if visuals_embedded or sys.platform == 'darwin':
@@ -809,6 +937,13 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
         else:
             vis = VisualTunnel(fullscreen=fullscreen)
             vis.start()
+    vis_off = None
+    if (visuals and preview) and (single_window or sys.platform == 'darwin'):
+        # Use offscreen so we can composite into a single cv2 window
+        vis_off = VisualTunnelOffscreen(width=640, height=360)
+        if not vis_off.init():
+            print("[visuals-offscreen] Failed to init; falling back to separate window")
+            vis_off = None
 
     gaze_prev = None
     gaze_speed_ema = EMA(alpha=0.2, init=np.array([0.0], dtype=np.float32))
@@ -822,14 +957,22 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
 
     try:
         while True:
-            # Get latest gaze + scene frame (non-blocking, small timeout)
-            gaze = device.receive_gaze_datum(timeout_seconds=0.1)
-            scene: Optional[SimpleVideoFrame] = device.receive_scene_video_frame(timeout_seconds=0.1)
+            # Get matched scene frame and gaze (timestamp-aligned)
+            matched = None
+            try:
+                matched = device.receive_matched_scene_video_frame_and_gaze(timeout_seconds=0.1)
+            except Exception:
+                matched = None
 
-            if gaze is None or scene is None:
-                # No fresh data; tiny sleep to avoid tight spin
-                time.sleep(0.005)
-                continue
+            if matched is None:
+                # Fallback to previous separate fetch if matched API not available
+                gaze = device.receive_gaze_datum(timeout_seconds=0.1)
+                scene: Optional[SimpleVideoFrame] = device.receive_scene_video_frame(timeout_seconds=0.1)
+                if gaze is None or scene is None:
+                    time.sleep(0.005)
+                    continue
+            else:
+                scene, gaze = matched
 
             # Drain eye events queue (blinks/fixations/saccades) and optionally print
             while True:
@@ -855,25 +998,31 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                     print("[blink] detected -> KICK")
                     last_blink_perf = time.perf_counter()
 
-            # Extract normalized gaze (0..1)
-            g = extract_norm_gaze_xy(gaze)
-            if g is None:
-                continue
-            gx, gy, conf = g
+            img = scene.bgr_pixels  # HxWx3, uint8
+            h, w = img.shape[:2]
+
+            # Prefer pixel-space gaze from matched API; fall back to normalized extraction
+            if matched is not None and hasattr(gaze, 'x') and hasattr(gaze, 'y'):
+                x = int(np.clip(float(getattr(gaze, 'x', 0.0)), 0, w - 1))
+                y = int(np.clip(float(getattr(gaze, 'y', 0.0)), 0, h - 1))
+                conf = float(getattr(gaze, 'confidence', 1.0)) if hasattr(gaze, 'confidence') else 1.0
+                gx = x / float(max(1, w - 1))
+                gy = y / float(max(1, h - 1))
+            else:
+                g = extract_norm_gaze_xy(gaze)
+                if g is None:
+                    continue
+                gx, gy, conf = g
+                x = int(np.clip(gx, 0.0, 1.0) * (w - 1))
+                y = int(np.clip(gy, 0.0, 1.0) * (h - 1))
+
             if conf < min_conf:
-                # Optionally fade amplitude on low confidence
                 synth.set_params(synth._freq, 0.0, synth._waveform)
                 continue
 
-            # Map normalized coords to pixel coords
-            img = scene.bgr_pixels  # HxWx3, uint8
-            h, w = img.shape[:2]
-            x = int(np.clip(gx, 0.0, 1.0) * (w - 1))
-            y = int(np.clip(gy, 0.0, 1.0) * (h - 1))
-
-            # Sample a small patch and compute average BGR
-            b, g_, r = avg_bgr_patch(img, x, y, half=int(max(0, patch_half)))
-            # Smooth RGB values
+            # Sample single pixel at gaze coordinate (no patch averaging)
+            b, g_, r = map(int, img[y, x])  # OpenCV is BGR order
+            # Smooth RGB values (EMA) to reduce flicker
             Rs, Gs, Bs = rgb_ema(np.array([r, g_, b], dtype=np.float32))
 
             # Map RGB to freq, amp, waveform
@@ -921,6 +1070,9 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
             # Map: speed -> u_speed (0..2), distort -> from S (0..2)
             u_speed_val = float(np.clip(speed_smooth * 10.0, 0.0, 2.0))
             u_distort_val = float(np.clip(S * 2.0, 0.0, 2.0))
+            u_speed_val = float(2.0)
+            u_distort_val = float(2.0)
+
             # Color vector for shader (0..1)
             col_vec3 = (float(Rs)/255.0, float(Gs)/255.0, float(Bs)/255.0)
             col_strength = float(np.clip(col_strength, 0.0, 1.0))
@@ -936,43 +1088,80 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
                     vis_emb.close()
                     vis_emb = None
 
-            # Optional preview
+            # -------- Combined Single Window (scene+eyes on left, visuals on right) --------
             if preview:
+                # Start from the scene image with overlays
                 vis_img = img.copy()
-                cv2.circle(vis_img, (x, y), 8, (0, 255, 255), 2)
+
+                # --- Red gaze ring (API snippet style) ---
+                cv2.circle(
+                    vis_img,
+                    (int(x), int(y)),
+                    radius=80,
+                    color=(0, 0, 255),
+                    thickness=15,
+                )
+
+                # --- HUD text (top-left) ---
                 cv2.putText(
                     vis_img,
-                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  note={freq:6.1f}Hz  vol={amp:0.2f}  cutoff={cutoff:4.0f}Hz  wave={waveform}  patch={int(max(0, patch_half))}  spd={speed_smooth:0.3f}  S={S:0.2f}  H={H:0.1f}  pupil={pupil_val:0.2f}(g={pupil_gamma:.2f},k={pupil_gain:.2f})  cs={col_strength:0.2f}",
-                    (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                    f"R={int(Rs)} G={int(Gs)} B={int(Bs)}  note={freq:6.1f}Hz  vol={amp:0.2f}  cutoff={cutoff:4.0f}Hz",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
                 cv2.putText(
                     vis_img,
-                    "Blink = Kick (one-shot)",
-                    (10, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-                if debug_eye_events:
-                    cv2.putText(
-                        vis_img,
-                        "Console: printing eye events",
-                        (10, 72),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
-                cv2.imshow("Scene", vis_img)
-                # ESC to quit
+                    f"spd={speed_smooth:0.3f}  S={S:0.2f}  pupil={pupil_val:0.2f}",
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,255,200), 1, cv2.LINE_AA)
+
+                # --- Eye camera frame (if available) ---
+                eye_frame = None
+                try:
+                    eye = device.receive_eyes_video_frame(timeout_seconds=0.0)
+                    if eye is not None:
+                        eye_frame = eye.bgr_pixels
+                except Exception:
+                    eye_frame = None
+
+                # Layout sizes
+                left_w = w
+                left_h = h
+                # Right visuals height matches left; width equals left_w (split 50/50)
+                right_w = left_w
+                right_h = left_h
+
+                # Render shader offscreen image if available
+                right_img = None
+                if vis_off is not None:
+                    t_now = time.perf_counter() - start_time
+                    right_rgb = vis_off.render_to_image(t_now, u_speed_val, u_distort_val, col_vec3, col_strength, pupil_val, pulse_age, right_w, right_h)
+                    if right_rgb is not None:
+                        # convert RGB->BGR for OpenCV
+                        right_img = right_rgb[:, :, ::-1]
+
+                # If no offscreen, just make a black panel with text
+                if right_img is None:
+                    right_img = np.zeros((right_h, right_w, 3), dtype=np.uint8)
+                    cv2.putText(right_img, "visuals window active separately", (20, right_h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 1, cv2.LINE_AA)
+
+                # Compose left column (scene + optional eyes thumbnail at bottom-left)
+                left_panel = vis_img
+                if eye_frame is not None:
+                    # scale eye frame to 1/3 height
+                    thumb_h = max(80, left_h // 3)
+                    scale = thumb_h / eye_frame.shape[0]
+                    thumb_w = int(eye_frame.shape[1] * scale)
+                    eye_thumb = cv2.resize(eye_frame, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    # paste onto bottom-left with a white border
+                    yb = left_h - thumb_h - 10
+                    xb = 10
+                    cv2.rectangle(left_panel, (xb-2, yb-2), (xb+thumb_w+2, yb+thumb_h+2), (255,255,255), 1)
+                    left_panel[yb:yb+thumb_h, xb:xb+thumb_w] = eye_thumb
+
+                # Final side-by-side canvas
+                canvas = np.zeros((max(left_h, right_h), left_w + right_w, 3), dtype=np.uint8)
+                canvas[0:left_h, 0:left_w] = left_panel
+                canvas[0:right_h, left_w:left_w+right_w] = right_img
+
+                cv2.imshow("Eyetrance — Live", canvas)
                 if (cv2.waitKey(1) & 0xFF) == 27:
                     break
 
@@ -991,6 +1180,11 @@ def main(ip: Optional[str], port: int, preview: bool, debug_eye_events: bool, vi
         try:
             if 'vis_emb' in locals() and vis_emb is not None:
                 vis_emb.close()
+        except Exception:
+            pass
+        try:
+            if 'vis_off' in locals() and vis_off is not None:
+                vis_off.close()
         except Exception:
             pass
         print("Bye.")
